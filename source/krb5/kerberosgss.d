@@ -1,4 +1,4 @@
-
+module krb5.kerberosgss;
 
 
         import core.stdc.config;
@@ -20752,6 +20752,7 @@ extern(C)
 
 
 struct __va_list_tag;
+version(1):
 import std.string : toStringz, fromStringz;
 import std.exception : enforce;
 import std.conv : octal;
@@ -20804,6 +20805,13 @@ enum AUTH_GSS_ERROR = -1;
 enum AUTH_GSS_COMPLETE = 1;
 enum AUTH_GSS_CONTINUE = 0;
 
+enum AuthStatus
+{
+ error = AUTH_GSS_ERROR,
+ complete = AUTH_GSS_COMPLETE,
+ continue_ = AUTH_GSS_CONTINUE,
+}
+
 enum GSS_AUTH_P_NONE = 1;
 enum GSS_AUTH_P_INTEGRITY = 2 ;
 enum GSS_AUTH_P_PRIVACY = 4;
@@ -20820,6 +20828,189 @@ struct gss_client_state
     int responseConf;
     OM_uint32 maj_stat;
     OM_uint32 min_stat;
+
+ static auto init(string service, string principal, long gss_flags, gss_server_state* delegatestate)
+ {
+  import std.typecons : tuple;
+  gss_client_state state;
+  gss_buffer_desc name_token = { 0 , null };
+  gss_buffer_desc principal_token = { 0 , null };
+  AuthStatus ret = AuthStatus.complete;
+
+  state.server_name = ( cast( gss_name_t ) 0 );
+  state.context = ( cast( gss_ctx_id_t ) 0 );
+  state.gss_flags = gss_flags;
+  state.client_creds = ( cast( gss_cred_id_t ) 0 );
+  state.username = null;
+  state.response = null;
+
+
+  name_token.length = service.length;
+  name_token.value = cast(void*) service.toStringz;
+
+  state.maj_stat = gss_import_name(
+   &state.min_stat, &name_token, gss_nt_service_name, &state.server_name
+  );
+
+  if (GSS_error(state.maj_stat)) {
+   ret = AuthStatus.error;
+   goto end;
+  }
+
+  if (delegatestate && delegatestate.client_creds != ( cast( gss_cred_id_t ) 0 )) {
+   state.client_creds = delegatestate.client_creds;
+  }
+
+  else if (principal.length > 0) {
+   gss_name_t name;
+   principal_token.length = principal.length;
+   principal_token.value = cast(void*) principal.toStringz;
+
+   state.maj_stat = gss_import_name(
+    &state.min_stat, &principal_token, GSS_C_NT_USER_NAME, &name
+   );
+   if (GSS_error(state.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+
+   state.maj_stat = gss_acquire_cred(
+    &state.min_stat, name, GSS_Indefinite, ( cast( gss_OID_set ) 0 ),
+    1, &state.client_creds, null, null
+   );
+   if (GSS_error(state.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+
+   state.maj_stat = gss_release_name(&state.min_stat, &name);
+   if (GSS_error(state.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+  }
+
+ end:
+  return tuple(ret,state);
+ }
+
+ AuthStatus clean()
+ {
+  OM_uint32 maj_stat;
+  OM_uint32 min_stat;
+  AuthStatus ret = AuthStatus.complete;
+
+  if (this.context != ( cast( gss_ctx_id_t ) 0 )) {
+   maj_stat = gss_delete_sec_context( &min_stat, &this.context, ( cast( gss_buffer_t ) 0 )
+   );
+  }
+  if (this.server_name != ( cast( gss_name_t ) 0 )) {
+   maj_stat = gss_release_name(&min_stat, &this.server_name);
+  }
+  if (
+   this.client_creds != ( cast( gss_cred_id_t ) 0 ) &&
+   ! (this.gss_flags & 1)
+  ) {
+   maj_stat = gss_release_cred(&min_stat, &this.client_creds);
+  }
+  if (this.username != null) {
+   free(this.username);
+   this.username = null;
+  }
+  if (this.response != null) {
+   free(this.response);
+   this.response = null;
+  }
+
+  return ret;
+ }
+
+ AuthStatus step(string challenge)
+ {
+  gss_buffer_desc input_token = { 0 , null };
+  gss_buffer_desc output_token = { 0 , null };
+  AuthStatus ret = AuthStatus.continue_;
+
+
+  if (this.response != null) {
+   free(this.response);
+   this.response = null;
+  }
+
+
+  if (challenge.length > 0)
+  {
+   auto encoded = Base64.decode(challenge).idup;
+   input_token.value = cast(void*) encoded.ptr;
+   input_token.length = encoded.length;
+  }
+
+
+  this.maj_stat = gss_init_sec_context(
+   &this.min_stat,
+   this.client_creds,
+   &this.context,
+   this.server_name,
+   ( cast( gss_OID ) 0 ),
+   cast(OM_uint32)this.gss_flags,
+   0,
+   ( cast( gss_channel_bindings_t ) 0 ),
+   &input_token,
+   null,
+   &output_token,
+   null,
+   null
+  );
+
+  if ((this.maj_stat != 0) && (this.maj_stat != ( 1 << ( 0 + 0 ) ))) {
+   ret = AuthStatus.error;
+   goto end;
+  }
+
+  ret = (this.maj_stat == 0) ? AuthStatus.complete : AuthStatus.continue_;
+
+  if (output_token.length) {
+   this.response = cast(char*)((cast(string)(Base64.encode((cast(const(ubyte)*)output_token.value)[0..output_token.length]).idup)).toStringz);
+   this.maj_stat = gss_release_buffer(&this.min_stat, &output_token);
+  }
+
+
+  if (ret == AUTH_GSS_COMPLETE) {
+   gss_name_t gssuser = ( cast( gss_name_t ) 0 );
+   this.maj_stat = gss_inquire_context(&this.min_stat, this.context, &gssuser, null, null, null, null, null, null);
+   if (GSS_error(this.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+
+   gss_buffer_desc name_token;
+   name_token.length = 0;
+   this.maj_stat = gss_display_name(&this.min_stat, gssuser, &name_token, null);
+   if (GSS_error(this.maj_stat)) {
+    if (name_token.value)
+     gss_release_buffer(&this.min_stat, &name_token);
+    gss_release_name(&this.min_stat, &gssuser);
+
+    ret = AuthStatus.error;
+    goto end;
+   } else {
+    this.username = cast(char *)malloc(name_token.length + 1);
+    strncpy(this.username, cast(char*) name_token.value, name_token.length);
+    this.username[name_token.length] = 0;
+    gss_release_buffer(&this.min_stat, &name_token);
+    gss_release_name(&this.min_stat, &gssuser);
+   }
+  }
+
+ end:
+  if (output_token.value) {
+   gss_release_buffer(&this.min_stat, &output_token);
+  }
+  if (input_token.value) {
+   free(input_token.value);
+  }
+  return ret;
+ }
 }
 
 struct gss_server_state
@@ -20835,407 +21026,200 @@ struct gss_server_state
     char* ccname;
     OM_uint32 maj_stat;
     OM_uint32 min_stat;
-}
 
-
-
-
-gss_client_state* new_gss_client_state() {
-    gss_client_state *state;
-
-    state = cast(gss_client_state *) malloc(gss_client_state.sizeof);
-
-    return state;
-}
-
-gss_server_state* new_gss_server_state() {
-    gss_server_state *state;
-
-    state = cast(gss_server_state *) malloc(gss_server_state.sizeof);
-
-    return state;
-}
-
-void free_gss_client_state(gss_client_state *state) {
-    free(state);
-}
-
-void free_gss_server_state(gss_server_state *state) {
-    free(state);
-}
-
-int authenticate_gss_client_init(string service, string principal, long gss_flags,
-    gss_server_state* delegatestate, gss_client_state* state
-)
-{
-    gss_buffer_desc name_token = { 0 , null };
-    gss_buffer_desc principal_token = { 0 , null };
-    int ret = AUTH_GSS_COMPLETE;
-
-    state.server_name = ( cast( gss_name_t ) 0 );
-    state.context = ( cast( gss_ctx_id_t ) 0 );
-    state.gss_flags = gss_flags;
-    state.client_creds = ( cast( gss_cred_id_t ) 0 );
-    state.username = null;
-    state.response = null;
-
-
-    name_token.length = service.length;
-    name_token.value = cast(void*) service.toStringz;
-
-    state.maj_stat = gss_import_name(
-        &state.min_stat, &name_token, gss_nt_service_name, &state.server_name
-    );
-
-    if (GSS_error(state.maj_stat)) {
-        ret = AUTH_GSS_ERROR;
-        goto end;
-    }
-
-    if (delegatestate && delegatestate.client_creds != ( cast( gss_cred_id_t ) 0 )) {
-        state.client_creds = delegatestate.client_creds;
-    }
-
-    else if (principal.length > 0) {
-        gss_name_t name;
-        principal_token.length = principal.length;
-        principal_token.value = cast(void*) principal.toStringz;
-
-        state.maj_stat = gss_import_name(
-            &state.min_stat, &principal_token, GSS_C_NT_USER_NAME, &name
-        );
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-         goto end;
-        }
-
-        state.maj_stat = gss_acquire_cred(
-            &state.min_stat, name, GSS_Indefinite, ( cast( gss_OID_set ) 0 ),
-            1, &state.client_creds, null, null
-        );
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-
-        state.maj_stat = gss_release_name(&state.min_stat, &name);
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-    }
-
-end:
-    return ret;
-}
-
-int authenticate_gss_client_clean(gss_client_state *state)
-{
-    OM_uint32 maj_stat;
-    OM_uint32 min_stat;
-    int ret = AUTH_GSS_COMPLETE;
-
-    if (state.context != ( cast( gss_ctx_id_t ) 0 )) {
-        maj_stat = gss_delete_sec_context(
-            &min_stat, &state.context, ( cast( gss_buffer_t ) 0 )
-        );
-    }
-    if (state.server_name != ( cast( gss_name_t ) 0 )) {
-        maj_stat = gss_release_name(&min_stat, &state.server_name);
-    }
-    if (
-        state.client_creds != ( cast( gss_cred_id_t ) 0 ) &&
-        ! (state.gss_flags & 1)
-    ) {
-        maj_stat = gss_release_cred(&min_stat, &state.client_creds);
-    }
-    if (state.username != null) {
-        free(state.username);
-        state.username = null;
-    }
-    if (state.response != null) {
-        free(state.response);
-        state.response = null;
-    }
-
-    return ret;
-}
-
-int authenticate_gss_client_step(gss_client_state* state, string challenge)
-{
-    gss_buffer_desc input_token = { 0 , null };
-    gss_buffer_desc output_token = { 0 , null };
-    int ret = AUTH_GSS_CONTINUE;
-
-
-    if (state.response != null) {
-        free(state.response);
-        state.response = null;
-    }
-
-
-    if (challenge.length > 0)
+ static auto init(string service)
  {
-        auto encoded = Base64.decode(challenge).idup;
-        input_token.value = cast(void*) encoded.ptr;
-        input_token.length = encoded.length;
-    }
+  import std.typecons : tuple;
+  gss_server_state state;
+  gss_buffer_desc name_token = { 0 , null };
+  AuthStatus ret = AuthStatus.complete;
+
+  state.context = ( cast( gss_ctx_id_t ) 0 );
+  state.server_name = ( cast( gss_name_t ) 0 );
+  state.client_name = ( cast( gss_name_t ) 0 );
+  state.server_creds = ( cast( gss_cred_id_t ) 0 );
+  state.client_creds = ( cast( gss_cred_id_t ) 0 );
+  state.username = null;
+  state.targetname = null;
+  state.response = null;
+  state.ccname = null;
 
 
-    state.maj_stat = gss_init_sec_context(
-        &state.min_stat,
-        state.client_creds,
-        &state.context,
-        state.server_name,
-        ( cast( gss_OID ) 0 ),
-        cast(OM_uint32)state.gss_flags,
-        0,
-        ( cast( gss_channel_bindings_t ) 0 ),
-        &input_token,
-        null,
-        &output_token,
-        null,
-        null
-    );
+  size_t service_len = service.length;
+  if (service_len != 0) {
 
-    if ((state.maj_stat != 0) && (state.maj_stat != ( 1 << ( 0 + 0 ) ))) {
-        ret = AUTH_GSS_ERROR;
-        goto end;
-    }
+   name_token.length = service.length;
+   name_token.value = cast(void*) service.toStringz;
+   state.maj_stat = gss_import_name(
+    &state.min_stat, &name_token, GSS_C_NT_HOSTBASED_SERVICE,
+    &state.server_name
+   );
 
-    ret = (state.maj_stat == 0) ? AUTH_GSS_COMPLETE : AUTH_GSS_CONTINUE;
-
-    if (output_token.length) {
-        state.response = cast(char*)((cast(string)(Base64.encode((cast(const(ubyte)*)output_token.value)[0..output_token.length]).idup)).toStringz);
-        state.maj_stat = gss_release_buffer(&state.min_stat, &output_token);
-    }
+   if (GSS_error(state.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
 
 
-    if (ret == AUTH_GSS_COMPLETE) {
-        gss_name_t gssuser = ( cast( gss_name_t ) 0 );
-        state.maj_stat = gss_inquire_context(&state.min_stat, state.context, &gssuser, null, null, null, null, null, null);
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
+   state.maj_stat = gss_acquire_cred(
+    &state.min_stat, ( cast( gss_name_t ) 0 ), GSS_Indefinite, ( cast( gss_OID_set ) 0 ),
+    0, &state.server_creds, null, null
+   );
 
-        gss_buffer_desc name_token;
-        name_token.length = 0;
-        state.maj_stat = gss_display_name(&state.min_stat, gssuser, &name_token, null);
-        if (GSS_error(state.maj_stat)) {
-            if (name_token.value)
-                gss_release_buffer(&state.min_stat, &name_token);
-            gss_release_name(&state.min_stat, &gssuser);
+   if (GSS_error(state.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+  }
 
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        } else {
-            state.username = cast(char *)malloc(name_token.length + 1);
-            strncpy(state.username, cast(char*) name_token.value, name_token.length);
-            state.username[name_token.length] = 0;
-            gss_release_buffer(&state.min_stat, &name_token);
-            gss_release_name(&state.min_stat, &gssuser);
-        }
-    }
+ end:
+  return tuple(ret,state);
+ }
 
-end:
-    if (output_token.value) {
-        gss_release_buffer(&state.min_stat, &output_token);
-    }
-    if (input_token.value) {
-        free(input_token.value);
-    }
-    return ret;
-}
-
-int authenticate_gss_server_init(string service, gss_server_state *state)
-{
-    gss_buffer_desc name_token = { 0 , null };
-    int ret = AUTH_GSS_COMPLETE;
-
-    state.context = ( cast( gss_ctx_id_t ) 0 );
-    state.server_name = ( cast( gss_name_t ) 0 );
-    state.client_name = ( cast( gss_name_t ) 0 );
-    state.server_creds = ( cast( gss_cred_id_t ) 0 );
-    state.client_creds = ( cast( gss_cred_id_t ) 0 );
-    state.username = null;
-    state.targetname = null;
-    state.response = null;
-    state.ccname = null;
-
-
-    size_t service_len = service.length;
-    if (service_len != 0) {
-
-        name_token.length = service.length;
-        name_token.value = cast(void*) service.toStringz;
-        state.maj_stat = gss_import_name(
-            &state.min_stat, &name_token, GSS_C_NT_HOSTBASED_SERVICE,
-            &state.server_name
-        );
-
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-
-
-        state.maj_stat = gss_acquire_cred(
-            &state.min_stat, ( cast( gss_name_t ) 0 ), GSS_Indefinite, ( cast( gss_OID_set ) 0 ),
-            0, &state.server_creds, null, null
-        );
-
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-    }
-
-end:
-    return ret;
-}
-
-int authenticate_gss_server_clean(gss_server_state *state)
-{
-    int ret = AUTH_GSS_COMPLETE;
-
-    if (state.context != ( cast( gss_ctx_id_t ) 0 )) {
-        state.maj_stat = gss_delete_sec_context(
-            &state.min_stat, &state.context, ( cast( gss_buffer_t ) 0 )
-        );
-    }
-    if (state.server_name != ( cast( gss_name_t ) 0 )) {
-        state.maj_stat = gss_release_name(&state.min_stat, &state.server_name);
-    }
-    if (state.client_name != ( cast( gss_name_t ) 0 )) {
-        state.maj_stat = gss_release_name(&state.min_stat, &state.client_name);
-    }
-    if (state.server_creds != ( cast( gss_cred_id_t ) 0 )) {
-        state.maj_stat = gss_release_cred(&state.min_stat, &state.server_creds);
-    }
-    if (state.client_creds != ( cast( gss_cred_id_t ) 0 )) {
-        state.maj_stat = gss_release_cred(&state.min_stat, &state.client_creds);
-    }
-    if (state.username != null) {
-        free(state.username);
-        state.username = null;
-    }
-    if (state.targetname != null) {
-        free(state.targetname);
-        state.targetname = null;
-    }
-    if (state.response != null) {
-        free(state.response);
-        state.response = null;
-    }
-    if (state.ccname != null) {
-        free(state.ccname);
-        state.ccname = null;
-    }
-
-    return ret;
-}
-
-int authenticate_gss_server_step(gss_server_state *state, string challenge)
-{
-    gss_buffer_desc input_token = { 0 , null };
-    gss_buffer_desc output_token = { 0 , null };
-    int ret = AUTH_GSS_CONTINUE;
-
-
-    if (state.response != null) {
-        free(state.response);
-        state.response = null;
-    }
-
-
-    if (challenge.length > 0)
+ AuthStatus clean()
  {
-  auto decoded = Base64.decode(challenge);
-        input_token.value = cast(char*) decoded.idup;
-        input_token.length = decoded.length;
-    } else
+  AuthStatus ret = AuthStatus.complete;
+
+  if (this.context != ( cast( gss_ctx_id_t ) 0 )) {
+   this.maj_stat = gss_delete_sec_context(
+    &this.min_stat, &this.context, ( cast( gss_buffer_t ) 0 )
+   );
+  }
+  if (this.server_name != ( cast( gss_name_t ) 0 )) {
+   this.maj_stat = gss_release_name(&this.min_stat, &this.server_name);
+  }
+  if (this.client_name != ( cast( gss_name_t ) 0 )) {
+   this.maj_stat = gss_release_name(&this.min_stat, &this.client_name);
+  }
+  if (this.server_creds != ( cast( gss_cred_id_t ) 0 )) {
+   this.maj_stat = gss_release_cred(&this.min_stat, &this.server_creds);
+  }
+  if (this.client_creds != ( cast( gss_cred_id_t ) 0 )) {
+   this.maj_stat = gss_release_cred(&this.min_stat, &this.client_creds);
+  }
+  if (this.username != null) {
+   free(this.username);
+   this.username = null;
+  }
+  if (this.targetname != null) {
+   free(this.targetname);
+   this.targetname = null;
+  }
+  if (this.response != null) {
+   free(this.response);
+   this.response = null;
+  }
+  if (this.ccname != null) {
+   free(this.ccname);
+   this.ccname = null;
+  }
+
+  return ret;
+ }
+
+ AuthStatus step(string challenge)
  {
+  gss_buffer_desc input_token = { 0 , null };
+  gss_buffer_desc output_token = { 0 , null };
+  AuthStatus ret = AuthStatus.continue_;
 
 
-        ret = AUTH_GSS_ERROR;
-        goto end;
-    }
-
-    state.maj_stat = gss_accept_sec_context(
-        &state.min_stat,
-        &state.context,
-        state.server_creds,
-        &input_token,
-        ( cast( gss_channel_bindings_t ) 0 ),
-        &state.client_name,
-        null,
-        &output_token,
-        null,
-        null,
-        &state.client_creds
-    );
-
-    if (GSS_error(state.maj_stat)) {
-        ret = AUTH_GSS_ERROR;
-        goto end;
-    }
+  if (this.response != null) {
+   free(this.response);
+   this.response = null;
+  }
 
 
-    if (output_token.length) {
-  auto encoded = Base64.encode((cast(const(ubyte) *)output_token.value)[0..output_token.length]);
-        state.response = cast(char*)encoded.idup;
-        state.maj_stat = gss_release_buffer(&state.min_stat, &output_token);
-    }
+  if (challenge.length > 0)
+  {
+   auto decoded = Base64.decode(challenge);
+   input_token.value = cast(char*) decoded.idup;
+   input_token.length = decoded.length;
+  } else
+  {
 
 
-    state.maj_stat = gss_display_name(
-        &state.min_stat, state.client_name, &output_token, null
-    );
-    if (GSS_error(state.maj_stat)) {
-        ret = AUTH_GSS_ERROR;
-        goto end;
-    }
-    state.username = cast(char *)malloc(output_token.length + 1);
-    strncpy(state.username, cast(char*) output_token.value, output_token.length);
-    state.username[output_token.length] = 0;
+   ret = AuthStatus.error;
+   goto end;
+  }
+
+  this.maj_stat = gss_accept_sec_context(
+   &this.min_stat,
+   &this.context,
+   this.server_creds,
+   &input_token,
+   ( cast( gss_channel_bindings_t ) 0 ),
+   &this.client_name,
+   null,
+   &output_token,
+   null,
+   null,
+   &this.client_creds
+  );
+
+  if (GSS_error(this.maj_stat)) {
+   ret = AuthStatus.error;
+   goto end;
+  }
 
 
-    if (state.server_creds == ( cast( gss_cred_id_t ) 0 )) {
-        gss_name_t target_name = ( cast( gss_name_t ) 0 );
-        state.maj_stat = gss_inquire_context(
-            &state.min_stat, state.context, null, &target_name, null, null, null,
-            null, null
-        );
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-        state.maj_stat = gss_display_name(
-            &state.min_stat, target_name, &output_token, null
-        );
-        if (GSS_error(state.maj_stat)) {
-            ret = AUTH_GSS_ERROR;
-            goto end;
-        }
-        state.targetname = cast(char *)malloc(output_token.length + 1);
-        strncpy(
-            state.targetname, cast(char*) output_token.value, output_token.length
-        );
-        state.targetname[output_token.length] = 0;
-    }
+  if (output_token.length) {
+   auto encoded = Base64.encode((cast(const(ubyte) *)output_token.value)[0..output_token.length]);
+   this.response = cast(char*)encoded.idup;
+   this.maj_stat = gss_release_buffer(&this.min_stat, &output_token);
+  }
 
-    ret = AUTH_GSS_COMPLETE;
 
-end:
-    if (output_token.length) {
-        gss_release_buffer(&state.min_stat, &output_token);
-    }
-    if (input_token.value) {
-        free(input_token.value);
-    }
-    return ret;
+  this.maj_stat = gss_display_name(
+   &this.min_stat, this.client_name, &output_token, null
+  );
+  if (GSS_error(this.maj_stat)) {
+   ret = AuthStatus.error;
+   goto end;
+  }
+  this.username = cast(char *)malloc(output_token.length + 1);
+  strncpy(this.username, cast(char*) output_token.value, output_token.length);
+  this.username[output_token.length] = 0;
+
+
+  if (this.server_creds == ( cast( gss_cred_id_t ) 0 )) {
+   gss_name_t target_name = ( cast( gss_name_t ) 0 );
+   this.maj_stat = gss_inquire_context(
+    &this.min_stat, this.context, null, &target_name, null, null, null,
+    null, null
+   );
+   if (GSS_error(this.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+   this.maj_stat = gss_display_name(
+    &this.min_stat, target_name, &output_token, null
+   );
+   if (GSS_error(this.maj_stat)) {
+    ret = AuthStatus.error;
+    goto end;
+   }
+   this.targetname = cast(char *)malloc(output_token.length + 1);
+   strncpy(
+    this.targetname, cast(char*) output_token.value, output_token.length
+   );
+   this.targetname[output_token.length] = 0;
+  }
+
+  ret = AuthStatus.complete;
+
+ end:
+  if (output_token.length) {
+   gss_release_buffer(&this.min_stat, &output_token);
+  }
+  if (input_token.value) {
+   free(input_token.value);
+  }
+  return ret;
+ }
+
 }
+
 
 void get_gss_error(OM_uint32 err_maj, char *buf_maj, OM_uint32 err_min, char *buf_min)
 {

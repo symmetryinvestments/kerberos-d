@@ -1,4 +1,4 @@
-
+module kerberosgss.hkrb5;
 
 
         import core.stdc.config;
@@ -12640,6 +12640,7 @@ extern(C)
 }
 
 
+version(Posix):
 
 
 
